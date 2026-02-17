@@ -1,4 +1,4 @@
-name: Release
+name: Auto Release (SemVer)
 
 on:
   push:
@@ -15,12 +15,78 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      - name: Compute next version from commits
+        id: ver
+        run: |
+          set -e
+          git fetch --tags
 
-      - run: npm install
+          # last tag (vX.Y.Z). If none, start at v0.0.0
+          LAST_TAG=$(git tag --list "v*" --sort=-v:refname | head -n 1)
+          if [ -z "$LAST_TAG" ]; then
+            LAST_TAG="v0.0.0"
+          fi
 
-      - run: npx semantic-release
+          # get commits since last tag (or all history if none)
+          RANGE="${LAST_TAG}..HEAD"
+          if [ "$LAST_TAG" = "v0.0.0" ] && ! git rev-parse "$LAST_TAG" >/dev/null 2>&1; then
+            RANGE="HEAD"
+          fi
+
+          COMMITS=$(git log --format=%s ${RANGE} || true)
+
+          MAJOR=0
+          MINOR=0
+          PATCH=0
+
+          # parse numeric parts from LAST_TAG
+          V=${LAST_TAG#v}
+          MAJOR=$(echo "$V" | cut -d. -f1)
+          MINOR=$(echo "$V" | cut -d. -f2)
+          PATCH=$(echo "$V" | cut -d. -f3)
+
+          # bump rules:
+          # - "BREAKING CHANGE" in subject OR "!" after type => MAJOR
+          # - "feat" => MINOR
+          # - "fix" => PATCH
+          BUMP="none"
+          echo "$COMMITS" | grep -q "BREAKING CHANGE" && BUMP="major" || true
+          echo "$COMMITS" | grep -Eq "^[a-z]+(\([^)]+\))?!:" && BUMP="major" || true
+
+          if [ "$BUMP" != "major" ]; then
+            echo "$COMMITS" | grep -Eq "^feat(\([^)]+\))?:" && BUMP="minor" || true
+          fi
+          if [ "$BUMP" = "none" ]; then
+            echo "$COMMITS" | grep -Eq "^fix(\([^)]+\))?:" && BUMP="patch" || true
+          fi
+
+          if [ "$BUMP" = "major" ]; then
+            MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0
+          elif [ "$BUMP" = "minor" ]; then
+            MINOR=$((MINOR+1)); PATCH=0
+          elif [ "$BUMP" = "patch" ]; then
+            PATCH=$((PATCH+1))
+          else
+            echo "No feat/fix/breaking commits -> no release"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Create tag
+        if: steps.ver.outputs.skip != 'true'
+        run: |
+          git tag "${{ steps.ver.outputs.new_tag }}"
+          git push origin "${{ steps.ver.outputs.new_tag }}"
+
+      - name: Create GitHub Release with auto notes
+        if: steps.ver.outputs.skip != 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.ver.outputs.new_tag }}" \
+            --title "${{ steps.ver.outputs.new_tag }}" \
+            --generate-notes
